@@ -1,0 +1,224 @@
+import { Router } from 'express';
+import { createPublicClient, http, encodeFunctionData, parseUnits, formatUnits } from 'viem';
+import { arbitrumSepolia } from 'viem/chains';
+import axios from 'axios';
+
+const router = Router();
+
+const getEnvOrFallback = (key: string, fallback: string) => process.env[key] || fallback;
+
+let cachedPublicClient: any = null;
+const getPublicClient = () => {
+  if (cachedPublicClient) return cachedPublicClient;
+  const rpcUrl = getEnvOrFallback('ALCHEMY_RPC_URL', getEnvOrFallback('ARB_SEPOLIA_RPC_URL', 'https://arbitrum-sepolia.publicnode.com'));
+  cachedPublicClient = createPublicClient({
+    chain: arbitrumSepolia,
+    transport: http(rpcUrl),
+  });
+  return cachedPublicClient;
+};
+
+const getAddresses = () => ({
+  USDC: getEnvOrFallback('USDC_ARB_SEPOLIA_ADDRESS', '0x75faf114eafb1BDbe2F0316DF893fd58CE46AA4d').toLowerCase() as `0x${string}`,
+  AUSDC: getEnvOrFallback('AUSDC_ARB_SEPOLIA_ADDRESS', '0x460b97BD498E1157530AEb3086301d5225b91216').toLowerCase() as `0x${string}`,
+  POOL: getEnvOrFallback('AAVE_ARB_SEPOLIA_POOL_ADDRESS', '0xBfC91D59fdAA134A4ED45f7B584cAf96D7792Eff').toLowerCase() as `0x${string}`,
+});
+
+const USDC_DECIMALS = 6;
+
+const erc20Abi = [
+  {
+    type: 'function',
+    name: 'balanceOf',
+    stateMutability: 'view',
+    inputs: [{ name: 'account', type: 'address' }],
+    outputs: [{ type: 'uint256' }],
+  },
+  {
+    type: 'function',
+    name: 'approve',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'spender', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ type: 'bool' }],
+  },
+];
+
+const poolAbi = [
+  {
+    type: 'function',
+    name: 'supply',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'asset', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+      { name: 'onBehalfOf', type: 'address' },
+      { name: 'referralCode', type: 'uint16' },
+    ],
+    outputs: [],
+  },
+  {
+    type: 'function',
+    name: 'withdraw',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'asset', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+      { name: 'to', type: 'address' },
+    ],
+    outputs: [{ type: 'uint256' }],
+  },
+];
+
+
+let cachedApy: number = 6.15;
+let lastApyFetch: number = 0;
+
+router.get('/balances/:address', async (req, res) => {
+  try {
+    const { address } = req.params;
+
+    const client = getPublicClient();
+    const addrs = getAddresses();
+
+    const [spendableBigInt, earningBigInt] = await Promise.all([
+      client.readContract({
+        address: addrs.USDC,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [address as `0x${string}`],
+      }) as Promise<bigint>,
+      client.readContract({
+        address: addrs.AUSDC,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [address as `0x${string}`],
+      }) as Promise<bigint>,
+    ]);
+
+    // Fetch APY with 5-minute cache
+    const now = Date.now();
+    if (now - lastApyFetch > 5 * 60 * 1000) {
+      try {
+        const response = await axios.get('https://yields.llama.fi/chart/7aab7b0f-01c1-4467-bc0d-77826d870f19', { timeout: 3000 });
+        if (response.data?.status === 'success' && response.data?.data?.length) {
+          const lastPoint = response.data.data[response.data.data.length - 1];
+          cachedApy = lastPoint.apy;
+          lastApyFetch = now;
+        }
+      } catch (e) {
+        console.error('Failed to fetch APY, using cache', e);
+      }
+    }
+
+    res.json({
+      spendableUsdc: parseFloat(formatUnits(spendableBigInt, USDC_DECIMALS)),
+      earningUsdc: parseFloat(formatUnits(earningBigInt, USDC_DECIMALS)),
+      aaveApy: cachedApy,
+    });
+  } catch (error) {
+    console.error('Balances Error:', error);
+    res.status(500).json({ error: 'Failed to fetch balances' });
+  }
+});
+
+router.get('/transactions/deposit', (req, res) => {
+  try {
+    const { user, amount } = req.query;
+    if (!user || !amount) return res.status(400).json({ error: 'Missing user or amount' });
+
+    const amountUnits = parseUnits(amount as string, USDC_DECIMALS);
+    const userAddress = user as `0x${string}`;
+
+    const addrs = getAddresses();
+
+    // Tx 1: Approve
+    const approveData = encodeFunctionData({
+      abi: erc20Abi,
+      functionName: 'approve',
+      args: [addrs.POOL, amountUnits],
+    });
+
+    const approveTx = {
+      to: addrs.USDC,
+      data: approveData,
+      value: '0x0',
+      chainId: arbitrumSepolia.id,
+    };
+
+    // Tx 2: Supply
+    const supplyData = encodeFunctionData({
+      abi: poolAbi,
+      functionName: 'supply',
+      args: [addrs.USDC, amountUnits, userAddress, 0],
+    });
+
+    const supplyTx = {
+      to: addrs.POOL,
+      data: supplyData,
+      value: '0x0',
+      chainId: arbitrumSepolia.id,
+    };
+
+    res.json({ approveTx, supplyTx });
+  } catch (error) {
+    console.error('Deposit Error:', error);
+    res.status(500).json({ error: 'Failed to build deposit tx' });
+  }
+});
+
+router.get('/transactions/withdraw', (req, res) => {
+  try {
+    const { user, amount } = req.query;
+    if (!user || !amount) return res.status(400).json({ error: 'Missing user or amount' });
+
+    const amountUnits = parseUnits(amount as string, USDC_DECIMALS);
+    const userAddress = user as `0x${string}`;
+
+    const addrs = getAddresses();
+
+    // Tx: Withdraw
+    const withdrawData = encodeFunctionData({
+      abi: poolAbi,
+      functionName: 'withdraw',
+      args: [addrs.USDC, amountUnits, userAddress],
+    });
+
+    const withdrawTx = {
+      to: addrs.POOL,
+      data: withdrawData,
+      value: '0x0',
+      chainId: arbitrumSepolia.id,
+    };
+
+    res.json({ withdrawTx });
+  } catch (error) {
+    console.error('Withdraw Error:', error);
+    res.status(500).json({ error: 'Failed to build withdraw tx' });
+  }
+});
+
+router.get('/transactions/receipt/:hash', async (req, res) => {
+  try {
+    const { hash } = req.params;
+    if (!hash || !hash.startsWith('0x')) return res.status(400).json({ error: 'Invalid hash' });
+    
+    const publicClient = getPublicClient();
+    try {
+      const receipt = await publicClient.getTransactionReceipt({ hash: hash as `0x${string}` });
+      res.json({ mined: true, status: receipt.status === 'success' });
+    } catch (e: any) {
+      if (e.name === 'TransactionReceiptNotFoundError' || e.message?.includes('could not be found')) {
+        return res.json({ mined: false });
+      }
+      throw e;
+    }
+  } catch (error) {
+    console.error('Fetch Receipt Error:', error);
+    res.status(500).json({ error: 'Failed to fetch receipt' });
+  }
+});
+
+export default router;

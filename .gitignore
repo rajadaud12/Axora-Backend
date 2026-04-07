@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.env
+*.log
+dinari.db
+dinari.db-shm
+dinari.db-wal
