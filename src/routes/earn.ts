@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { createPublicClient, http, encodeFunctionData, parseUnits, formatUnits } from 'viem';
 import { arbitrumSepolia } from 'viem/chains';
 import axios from 'axios';
+import { getSmartAccountAddress, buildUserOperation, executeUserOperation, bundlerClient } from '../services/aaService';
 
 const router = Router();
 
@@ -80,10 +81,12 @@ router.get('/balances/:address', async (req, res) => {
   try {
     const { address } = req.params;
 
+    const smartAccountAddress = await getSmartAccountAddress(address as `0x${string}`);
+
     const client = getPublicClient();
     const addrs = getAddresses();
 
-    const [spendableBigInt, earningBigInt] = await Promise.all([
+    const [eoaSpend, eoaEarn, saSpend, saEarn] = await Promise.all([
       client.readContract({
         address: addrs.USDC,
         abi: erc20Abi,
@@ -96,9 +99,23 @@ router.get('/balances/:address', async (req, res) => {
         functionName: 'balanceOf',
         args: [address as `0x${string}`],
       }) as Promise<bigint>,
+      client.readContract({
+        address: addrs.USDC,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [smartAccountAddress],
+      }) as Promise<bigint>,
+      client.readContract({
+        address: addrs.AUSDC,
+        abi: erc20Abi,
+        functionName: 'balanceOf',
+        args: [smartAccountAddress],
+      }) as Promise<bigint>,
     ]);
 
-    // Fetch APY with 5-minute cache
+    const spendableBigInt = saSpend;
+    const earningBigInt = saEarn;
+
     const now = Date.now();
     if (now - lastApyFetch > 5 * 60 * 1000) {
       try {
@@ -117,6 +134,7 @@ router.get('/balances/:address', async (req, res) => {
       spendableUsdc: parseFloat(formatUnits(spendableBigInt, USDC_DECIMALS)),
       earningUsdc: parseFloat(formatUnits(earningBigInt, USDC_DECIMALS)),
       aaveApy: cachedApy,
+      smartAccountAddress,
     });
   } catch (error) {
     console.error('Balances Error:', error);
@@ -124,7 +142,7 @@ router.get('/balances/:address', async (req, res) => {
   }
 });
 
-router.get('/transactions/deposit', (req, res) => {
+router.get('/transactions/deposit', async (req, res) => {
   try {
     const { user, amount } = req.query;
     if (!user || !amount) return res.status(400).json({ error: 'Missing user or amount' });
@@ -133,43 +151,38 @@ router.get('/transactions/deposit', (req, res) => {
     const userAddress = user as `0x${string}`;
 
     const addrs = getAddresses();
+    const smartAccountAddress = await getSmartAccountAddress(userAddress);
 
-    // Tx 1: Approve
     const approveData = encodeFunctionData({
       abi: erc20Abi,
       functionName: 'approve',
       args: [addrs.POOL, amountUnits],
     });
 
-    const approveTx = {
-      to: addrs.USDC,
-      data: approveData,
-      value: '0x0',
-      chainId: arbitrumSepolia.id,
-    };
-
-    // Tx 2: Supply
     const supplyData = encodeFunctionData({
       abi: poolAbi,
       functionName: 'supply',
-      args: [addrs.USDC, amountUnits, userAddress, 0],
+      args: [addrs.USDC, amountUnits, smartAccountAddress, 0],
     });
 
-    const supplyTx = {
-      to: addrs.POOL,
-      data: supplyData,
-      value: '0x0',
-      chainId: arbitrumSepolia.id,
-    };
+    const calls = [
+        { to: addrs.USDC, data: approveData, value: 0n },
+        { to: addrs.POOL, data: supplyData, value: 0n },
+    ];
 
-    res.json({ approveTx, supplyTx });
+    const { userOp, userOpHash } = await buildUserOperation(userAddress, calls);
+
+    const bigIntReplacer = (key: any, value: any) =>
+        typeof value === 'bigint' ? value.toString() : value;
+
+    res.json(JSON.parse(JSON.stringify({ userOp, userOpHash, smartAccountAddress }, bigIntReplacer)));
   } catch (error) {
     console.error('Deposit Error:', error);
     res.status(500).json({ error: 'Failed to build deposit tx' });
   }
 });
 
-router.get('/transactions/withdraw', (req, res) => {
+router.get('/transactions/withdraw', async (req, res) => {
   try {
     const { user, amount } = req.query;
     if (!user || !amount) return res.status(400).json({ error: 'Missing user or amount' });
@@ -178,26 +191,41 @@ router.get('/transactions/withdraw', (req, res) => {
     const userAddress = user as `0x${string}`;
 
     const addrs = getAddresses();
+    const smartAccountAddress = await getSmartAccountAddress(userAddress);
 
-    // Tx: Withdraw
     const withdrawData = encodeFunctionData({
       abi: poolAbi,
       functionName: 'withdraw',
-      args: [addrs.USDC, amountUnits, userAddress],
+      args: [addrs.USDC, amountUnits, smartAccountAddress],
     });
 
-    const withdrawTx = {
-      to: addrs.POOL,
-      data: withdrawData,
-      value: '0x0',
-      chainId: arbitrumSepolia.id,
-    };
+    const calls = [
+      { to: addrs.POOL, data: withdrawData, value: 0n },
+    ];
 
-    res.json({ withdrawTx });
+    const { userOp, userOpHash } = await buildUserOperation(userAddress, calls);
+
+    const bigIntReplacer = (key: any, value: any) =>
+        typeof value === 'bigint' ? value.toString() : value;
+
+    res.json(JSON.parse(JSON.stringify({ userOp, userOpHash, smartAccountAddress }, bigIntReplacer)));
   } catch (error) {
     console.error('Withdraw Error:', error);
     res.status(500).json({ error: 'Failed to build withdraw tx' });
   }
+});
+
+router.post('/transactions/execute-userop', async (req, res) => {
+    try {
+        const { userOp, signature } = req.body;
+        if (!userOp || !signature) return res.status(400).json({ error: 'Missing userOp or signature' });
+
+        const hash = await executeUserOperation(userOp, signature);
+        res.json({ hash });
+    } catch (error) {
+        console.error('Execute UserOp Error:', error);
+        res.status(500).json({ error: 'Failed to execute userOp' });
+    }
 });
 
 router.get('/transactions/receipt/:hash', async (req, res) => {
@@ -205,12 +233,15 @@ router.get('/transactions/receipt/:hash', async (req, res) => {
     const { hash } = req.params;
     if (!hash || !hash.startsWith('0x')) return res.status(400).json({ error: 'Invalid hash' });
     
-    const publicClient = getPublicClient();
     try {
-      const receipt = await publicClient.getTransactionReceipt({ hash: hash as `0x${string}` });
-      res.json({ mined: true, status: receipt.status === 'success' });
+      const receipt = await (bundlerClient as any).getUserOperationReceipt({ hash: hash as `0x${string}` });
+      if (!receipt) {
+        return res.json({ mined: false });
+      }
+      res.json({ mined: true, status: receipt.success });
     } catch (e: any) {
-      if (e.name === 'TransactionReceiptNotFoundError' || e.message?.includes('could not be found')) {
+      // Viem usually returns null if not found for bundler endpoints, but catch just in case
+      if (e.message?.includes('could not be found') || e.message?.toLowerCase().includes('not found')) {
         return res.json({ mined: false });
       }
       throw e;

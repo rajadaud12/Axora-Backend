@@ -37,4 +37,9 @@ export function saveUser(walletAddress: string, entityId: string, accountId: str
   stmt.run(walletAddress.toLowerCase(), entityId, accountId);
 }
 
+export function deleteUser(walletAddress: string): void {
+  const stmt = db.prepare('DELETE FROM dinari_users WHERE wallet_address = ?');
+  stmt.run(walletAddress.toLowerCase());
+}
+
 export default db;

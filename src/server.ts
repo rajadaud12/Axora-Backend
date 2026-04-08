@@ -19,6 +19,16 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
 });
 
+// Global error handler
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  console.error('Unhandled Backend Error:', err);
+  res.status(500).json({
+    error: 'Internal Server Error',
+    message: err.message,
+    stack: process.env.NODE_ENV === 'development' ? err.stack : undefined
+  });
+});
+
 const server = app.listen(PORT, () => {
   console.log(`Backend server running on http://localhost:${PORT}`);
 });
