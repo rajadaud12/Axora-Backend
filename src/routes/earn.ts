@@ -2,7 +2,14 @@ import { Router } from 'express';
 import { createPublicClient, http, encodeFunctionData, parseUnits, formatUnits } from 'viem';
 import { arbitrumSepolia } from 'viem/chains';
 import axios from 'axios';
-import { getSmartAccountAddress, buildUserOperation, executeUserOperation, bundlerClient } from '../services/aaService';
+import {
+  getSmartAccountAddress,
+  buildUserOperation,
+  executeUserOperation,
+  bundlerClient,
+  bundlerClientSepolia,
+} from '../services/aaService';
+import type { AaBundlerNetwork } from '../services/aaService';
 
 const router = Router();
 
@@ -217,10 +224,12 @@ router.get('/transactions/withdraw', async (req, res) => {
 
 router.post('/transactions/execute-userop', async (req, res) => {
     try {
-        const { userOp, signature } = req.body;
+        const { userOp, signature, chainId } = req.body;
         if (!userOp || !signature) return res.status(400).json({ error: 'Missing userOp or signature' });
 
-        const hash = await executeUserOperation(userOp, signature);
+        const network: AaBundlerNetwork =
+          chainId === 'eip155:11155111' ? 'sepolia' : 'arbitrumSepolia';
+        const hash = await executeUserOperation(userOp, signature, network);
         res.json({ hash });
     } catch (error) {
         console.error('Execute UserOp Error:', error);
@@ -232,9 +241,12 @@ router.get('/transactions/receipt/:hash', async (req, res) => {
   try {
     const { hash } = req.params;
     if (!hash || !hash.startsWith('0x')) return res.status(400).json({ error: 'Invalid hash' });
-    
+
+    const chainId = typeof req.query.chainId === 'string' ? req.query.chainId.trim() : '';
+    const bc = chainId === 'eip155:11155111' ? bundlerClientSepolia : bundlerClient;
+
     try {
-      const receipt = await (bundlerClient as any).getUserOperationReceipt({ hash: hash as `0x${string}` });
+      const receipt = await (bc as any).getUserOperationReceipt({ hash: hash as `0x${string}` });
       if (!receipt) {
         return res.json({ mined: false });
       }
