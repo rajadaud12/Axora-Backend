@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto';
 import { Router } from 'express';
 import Dinari from '@dinari/api-sdk';
 import axios from 'axios';
@@ -7,13 +8,33 @@ import {
   http,
   formatUnits,
   parseUnits,
+  encodeFunctionData,
+  parseAbi,
+  decodeEventLog,
 } from 'viem';
 import { arbitrumSepolia, sepolia } from 'viem/chains';
-import { getUserByWallet, saveUser, deleteUser } from '../db';
+import {
+  getUserByWallet,
+  saveUser,
+  deleteUser,
+  insertOmnibusPendingBuy,
+  getOmnibusPendingBuy,
+  updateOmnibusPendingBuy,
+  insertOmnibusPendingSell,
+  getOmnibusPendingSell,
+  updateOmnibusPendingSell,
+  listOmnibusPendingBuys,
+  listOmnibusPendingSells,
+  getOmnibusSellAccounting,
+  upsertOmnibusSellAccounting,
+} from '../db';
 import {
   getSmartAccountAddress,
   isSmartAccountDeployedOnChain,
   buildDeployOnlyUserOperation,
+  buildUserOperation,
+  bundlerClient,
+  bundlerClientSepolia,
   aaNetworkFromCaip2,
 } from '../services/aaService';
 
@@ -181,8 +202,273 @@ const erc20BalanceAbi = [
   },
 ] as const;
 
+const erc20TransferCallAbi = [
+  {
+    type: 'function',
+    name: 'transfer',
+    stateMutability: 'nonpayable',
+    inputs: [
+      { name: 'to', type: 'address' },
+      { name: 'amount', type: 'uint256' },
+    ],
+    outputs: [{ type: 'bool' }],
+  },
+] as const;
+
+const transferEventAbi = parseAbi([
+  'event Transfer(address indexed from, address indexed to, uint256 value)',
+]);
+
+function getOmnibusEnv(): { accountId: string; wallet: `0x${string}` } | null {
+  const accountId = process.env['OMNIBUS_ACCOUNT_ID']?.trim();
+  const w = process.env['OMNIBUS_MANAGED_WALLET']?.trim();
+  if (!accountId || !w) return null;
+  try {
+    return { accountId, wallet: getAddress(w) as `0x${string}` };
+  } catch {
+    return null;
+  }
+}
+
+function omnibusDepositConfig():
+  | null
+  | {
+      accountId: string;
+      depositWallet: `0x${string}`;
+      depositChainCaip2: string;
+    } {
+  const base = getOmnibusEnv();
+  if (!base) return null;
+  return {
+    accountId: base.accountId,
+    depositWallet: base.wallet,
+    depositChainCaip2: ORDER_CHAIN_ID,
+  };
+}
+
+/** Some SDK list calls may return a bare array or a wrapped object. */
+function normalizeSdkList(x: unknown): any[] {
+  if (Array.isArray(x)) return x;
+  if (x && typeof x === 'object') {
+    const o = x as Record<string, unknown>;
+    if (Array.isArray(o.items)) return o.items as any[];
+    if (Array.isArray(o.data)) return o.data as any[];
+    if (Array.isArray(o.results)) return o.results as any[];
+  }
+  return [];
+}
+
+async function getCashBalanceRowForChain(
+  client: Dinari,
+  accountId: string,
+  chainCaip2: string,
+): Promise<{ token_address: `0x${string}`; symbol: string; amount: number } | null> {
+  try {
+    const raw = (await client.v2.accounts.getCashBalances(accountId)) as unknown;
+    const rows = normalizeSdkList(raw);
+    const row = rows.find((c: any) => c?.chain_id === chainCaip2);
+    if (!row?.token_address) return null;
+    return {
+      token_address: toChecksumAddress(String(row.token_address)) as `0x${string}`,
+      symbol: String(row.symbol ?? ''),
+      amount: Number(row.amount ?? 0),
+    };
+  } catch (e: any) {
+    console.warn('  getCashBalances:', e?.message || e);
+    return null;
+  }
+}
+
+/** On-chain token for omnibus deposit — matches Dinari GET /cash on this chain (sandbox mockUSD). */
+async function resolveUserOmnibusDepositToken(
+  client: Dinari,
+  userAccountId: string,
+  chainCaip2: string,
+): Promise<{ token: `0x${string}`; decimals: number }> {
+  const envTok =
+    process.env['OMNIBUS_DEPOSIT_TOKEN']?.trim() || process.env['DINARI_PAYMENT_TOKEN']?.trim();
+  if (envTok) {
+    const dec = parseInt(process.env['OMNIBUS_DEPOSIT_DECIMALS'] || '6', 10);
+    return {
+      token: toChecksumAddress(envTok) as `0x${string}`,
+      decimals: Number.isFinite(dec) ? dec : 6,
+    };
+  }
+  const row = await getCashBalanceRowForChain(client, userAccountId, chainCaip2);
+  if (row?.token_address) {
+    return { token: row.token_address, decimals: 6 };
+  }
+  const fallback = await resolvePaymentTokenForPermit(client, userAccountId, chainCaip2);
+  return { token: toChecksumAddress(fallback) as `0x${string}`, decimals: 6 };
+}
+
+function sumMatchingTransfersFromLogs(
+  logs: readonly { address?: string; data?: `0x${string}`; topics?: readonly `0x${string}`[] }[],
+  token: `0x${string}`,
+  expectedFrom: `0x${string}`,
+  expectedTo: `0x${string}`,
+): bigint {
+  const fromL = expectedFrom.toLowerCase();
+  const toL = expectedTo.toLowerCase();
+  const tokenL = token.toLowerCase();
+  let total = 0n;
+  for (const log of logs) {
+    if (!log?.address || String(log.address).toLowerCase() !== tokenL) continue;
+    try {
+      const decoded = decodeEventLog({
+        abi: transferEventAbi,
+        data: log.data as `0x${string}`,
+        topics: log.topics as [`0x${string}`, ...`0x${string}`[]],
+      });
+      if (decoded.eventName !== 'Transfer') continue;
+      const args = decoded.args as { from: `0x${string}`; to: `0x${string}`; value: bigint };
+      if (args.from.toLowerCase() === fromL && args.to.toLowerCase() === toL) total += args.value;
+    } catch {
+      /* not a Transfer */
+    }
+  }
+  return total;
+}
+
+async function erc20TransferTotalFromUserOpHash(
+  userOpHash: `0x${string}`,
+  chainId: string,
+  token: `0x${string}`,
+  from: `0x${string}`,
+  to: `0x${string}`,
+): Promise<bigint> {
+  const bc = chainId === 'eip155:11155111' ? bundlerClientSepolia : bundlerClient;
+  // Receipt can lag the HTTP response — short polls feel much faster than failing once.
+  for (let attempt = 0; attempt < 12; attempt++) {
+    const raw = await (bc as any).getUserOperationReceipt({
+      hash: userOpHash,
+    });
+    if (raw) {
+      const logs = (raw.receipt?.logs ?? raw.logs ?? []) as any[];
+      const sum = sumMatchingTransfersFromLogs(logs, token, from, to);
+      if (sum > 0n) return sum;
+    }
+    await sleep(attempt < 4 ? 120 : attempt < 8 ? 200 : 320);
+  }
+  return 0n;
+}
+
+async function erc20TransferTotalFromTxHash(
+  txHash: `0x${string}`,
+  chainId: string,
+  token: `0x${string}`,
+  from: `0x${string}`,
+  to: `0x${string}`,
+): Promise<bigint> {
+  const url = rpcUrlForOrderChain(chainId);
+  if (!url) return 0n;
+  const chain = chainId === 'eip155:11155111' ? sepolia : arbitrumSepolia;
+  const client = createPublicClient({ chain, transport: http(url) });
+  const receipt = await client.getTransactionReceipt({ hash: txHash });
+  if (!receipt) return 0n;
+  return sumMatchingTransfersFromLogs(receipt.logs, token, from, to);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((r) => setTimeout(r, ms));
+}
+
+/** Dinari quote objects vary by API version — extract a positive USD-ish price. */
+function coercePositiveNumber(v: unknown): number | null {
+  if (v == null) return null;
+  if (typeof v === 'number' && Number.isFinite(v) && v > 0) return v;
+  if (typeof v === 'string') {
+    const n = parseFloat(String(v).replace(/[^0-9.-]/g, ''));
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  if (typeof v === 'object') {
+    const o = v as Record<string, unknown>;
+    for (const k of ['amount', 'value', 'usd', 'price']) {
+      const c = coercePositiveNumber(o[k]);
+      if (c != null) return c;
+    }
+  }
+  return null;
+}
+
+function pickQuotePriceUsd(q: any): number {
+  if (q == null || typeof q !== 'object') return 0;
+  const paths = [
+    q.price,
+    q.last_price,
+    q.lastPrice,
+    q.usd_price,
+    q.usdPrice,
+    q.market_price,
+    q.close,
+    q.previous_close,
+    q.open,
+    q.current_price,
+    q.stock_price,
+    q.notional_price,
+    q.dshare_price,
+    q.stock?.price,
+    q.data?.price,
+  ];
+  for (const p of paths) {
+    const n = coercePositiveNumber(p);
+    if (n != null) return n;
+  }
+  if (q.quote && typeof q.quote === 'object') {
+    const nested = pickQuotePriceUsd(q.quote);
+    if (nested > 0) return nested;
+  }
+  return 0;
+}
+
+function isStalePending(createdAt: string | null, ttlMs: number): boolean {
+  const createdMs =
+    createdAt != null && String(createdAt).trim() !== ''
+      ? new Date(createdAt).getTime()
+      : NaN;
+  const saneCreated = Number.isFinite(createdMs) && createdMs > Date.UTC(2020, 0, 1);
+  return !!(saneCreated && Date.now() - createdMs > ttlMs);
+}
+
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
+}
+
+async function snapshotManagedSell(
+  client: Dinari,
+  accountId: string,
+  orderRequestId: string,
+  recipientAccountId?: string,
+): Promise<{
+  orderRequest: any;
+  order: any | null;
+  gross: number;
+  fee: number;
+  net: number;
+}> {
+  const reqState = await client.v2.accounts.orderRequests.retrieve(orderRequestId, { account_id: accountId });
+  let ord: any = null;
+  if (reqState?.order_id) {
+    const orderId = String(reqState.order_id);
+    const accountCandidates = [
+      String(reqState?.account_id || '').trim(),
+      String(accountId || '').trim(),
+      String(recipientAccountId || '').trim(),
+    ].filter(Boolean);
+    const uniqueCandidates = [...new Set(accountCandidates)];
+    for (const candidate of uniqueCandidates) {
+      try {
+        ord = await client.v2.accounts.orders.retrieve(orderId, { account_id: candidate });
+        break;
+      } catch {
+        // try next candidate
+      }
+    }
+  }
+  const gross = Number(ord?.payment_token_quantity ?? 0);
+  const fee = Number(ord?.fee ?? 0);
+  const net = Math.max(0, gross - fee);
+  return { orderRequest: reqState, order: ord, gross, fee, net };
 }
 
 function rpcUrlForOrderChain(orderChainId: string): string | undefined {
@@ -292,7 +578,7 @@ async function tapFaucetAndConfirmOnChain(
       orderChainId,
       attempt === 0 ? `${labelPrefix} (initial)` : `${labelPrefix} (retry ${attempt})`,
     );
-    await sleep(attempt === 0 ? 1500 : 2500);
+    await sleep(attempt === 0 ? 600 : 1000);
     paymentToken = await resolvePaymentTokenForPermit(client, accountId, orderChainId);
 
     const snap = await readErc20Balance(
@@ -1026,6 +1312,617 @@ router.post('/order/prepare-buy', async (req, res) => {
   }
 });
 
+// ── OMNIBUS / MANAGED WALLET BUY (mockUSD/USD+ on-chain → omnibus, managed market buy → user account) ─
+router.post('/order/omnibus/prepare-buy', async (req, res) => {
+  try {
+    const cfg = omnibusDepositConfig();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'Omnibus not configured',
+        details: 'Set OMNIBUS_ACCOUNT_ID and OMNIBUS_MANAGED_WALLET in .env',
+      });
+    }
+    const { walletAddress, stockId, paymentAmount } = req.body;
+    if (!walletAddress || !stockId || paymentAmount == null)
+      return res.status(400).json({ error: 'walletAddress, stockId, paymentAmount required' });
+
+    const user = getUserByWallet(String(walletAddress).toLowerCase());
+    if (!user) return res.status(404).json({ error: 'User not set up. Call /setup first.' });
+
+    if (cfg.depositChainCaip2 !== SMART_WALLET_CHAIN_ID) {
+      return res.status(400).json({
+        error: 'Omnibus deposit chain mismatch',
+        details: `Omnibus deposits use ${cfg.depositChainCaip2}; smart wallet must be linked on the same chain (DINARI_WALLET_CHAIN_ID).`,
+      });
+    }
+
+    const client = getDinariClient();
+    const actualStockId = await resolveStockId(client, stockId);
+    const amt = parseFloat(String(paymentAmount));
+    if (!Number.isFinite(amt) || amt <= 0)
+      return res.status(400).json({ error: 'paymentAmount must be a positive number' });
+
+    const clientOrderId = randomUUID();
+    insertOmnibusPendingBuy({
+      client_order_id: clientOrderId,
+      wallet_address: walletAddress,
+      recipient_account_id: user.account_id,
+      stock_id: actualStockId,
+      payment_amount: amt.toFixed(6),
+    });
+
+    const eoaChecksum = toChecksumAddress(walletAddress);
+    const smartWallet = (await deriveSmartWallet(eoaChecksum)) as `0x${string}`;
+
+    const { token: depTok, decimals: depDec } = await resolveUserOmnibusDepositToken(
+      client,
+      user.account_id,
+      cfg.depositChainCaip2,
+    );
+
+    res.json({
+      mode: 'omnibus',
+      clientOrderId,
+      depositAddress: cfg.depositWallet,
+      depositToken: depTok,
+      depositDecimals: depDec,
+      depositChainId: cfg.depositChainCaip2,
+      paymentAmount: amt,
+      payerSmartWallet: smartWallet,
+      recipientDinariAccountId: user.account_id,
+      stockId: actualStockId,
+    });
+  } catch (error: any) {
+    console.error('Omnibus Prepare Buy Error:', error.message || error);
+    res.status(500).json({ error: 'Failed to prepare omnibus buy', details: error.message });
+  }
+});
+
+router.get('/order/omnibus/transfer-userop', async (req, res) => {
+  try {
+    const cfg = omnibusDepositConfig();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'Omnibus not configured',
+        details: 'Set OMNIBUS_ACCOUNT_ID and OMNIBUS_MANAGED_WALLET in .env',
+      });
+    }
+    const walletAddress = typeof req.query.walletAddress === 'string' ? req.query.walletAddress.trim() : '';
+    const clientOrderId = typeof req.query.clientOrderId === 'string' ? req.query.clientOrderId.trim() : '';
+    if (!walletAddress || !clientOrderId)
+      return res.status(400).json({ error: 'walletAddress and clientOrderId query params required' });
+
+    const pending = getOmnibusPendingBuy(clientOrderId);
+    if (!pending || pending.wallet_address !== walletAddress.toLowerCase()) {
+      return res.status(404).json({ error: 'Unknown or expired clientOrderId for this wallet' });
+    }
+    if (pending.status !== 'awaiting_deposit') {
+      return res.status(400).json({ error: `Invalid status: ${pending.status}` });
+    }
+
+    const dbUser = getUserByWallet(pending.wallet_address.toLowerCase());
+    if (!dbUser) return res.status(404).json({ error: 'User not found' });
+
+    const dclient = getDinariClient();
+    const { token: depTok, decimals: depDec } = await resolveUserOmnibusDepositToken(
+      dclient,
+      dbUser.account_id,
+      cfg.depositChainCaip2,
+    );
+
+    const eoa = toChecksumAddress(walletAddress) as `0x${string}`;
+    const smartWallet = (await deriveSmartWallet(eoa)) as `0x${string}`;
+    const amountWei = parseUnits(pending.payment_amount, depDec);
+    const data = encodeFunctionData({
+      abi: erc20TransferCallAbi,
+      functionName: 'transfer',
+      args: [cfg.depositWallet, amountWei],
+    });
+
+    const { userOp, userOpHash } = await buildUserOperation(
+      eoa,
+      [{ to: depTok, data, value: 0n }],
+      aaNetworkFromCaip2(cfg.depositChainCaip2),
+    );
+
+    const bigIntReplacer = (_k: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
+    res.json(
+      JSON.parse(
+        JSON.stringify(
+          {
+            userOp,
+            userOpHash,
+            smartAccountAddress: smartWallet,
+            executeUserOpChainId: cfg.depositChainCaip2,
+            depositToken: depTok,
+            amount: pending.payment_amount,
+          },
+          bigIntReplacer,
+        ),
+      ),
+    );
+  } catch (error: any) {
+    console.error('Omnibus Transfer UserOp Error:', error.message || error);
+    res.status(500).json({ error: 'Failed to build deposit UserOp', details: error.message });
+  }
+});
+
+router.post('/order/omnibus/confirm-buy', async (req, res) => {
+  try {
+    const cfg = omnibusDepositConfig();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'Omnibus not configured',
+        details: 'Set OMNIBUS_ACCOUNT_ID and OMNIBUS_MANAGED_WALLET in .env',
+      });
+    }
+    const { walletAddress, clientOrderId, depositUserOpHash, depositTxHash } = req.body;
+    if (!walletAddress || !clientOrderId)
+      return res.status(400).json({ error: 'walletAddress and clientOrderId required' });
+    if (!depositUserOpHash && !depositTxHash)
+      return res.status(400).json({ error: 'depositUserOpHash or depositTxHash required' });
+
+    const pending = getOmnibusPendingBuy(clientOrderId);
+    if (!pending || pending.wallet_address !== String(walletAddress).toLowerCase()) {
+      return res.status(404).json({ error: 'Unknown clientOrderId for this wallet' });
+    }
+    if (pending.status === 'completed') {
+      return res.status(400).json({ error: 'This purchase was already submitted' });
+    }
+    if (pending.status !== 'awaiting_deposit') {
+      return res.status(400).json({ error: `Invalid status: ${pending.status}` });
+    }
+
+    if (isStalePending(pending.created_at, 60 * 60 * 1000)) {
+      updateOmnibusPendingBuy(clientOrderId, { status: 'expired' });
+      return res.status(400).json({ error: 'clientOrderId expired; start a new prepare-buy' });
+    }
+
+    const dbUser = getUserByWallet(pending.wallet_address.toLowerCase());
+    if (!dbUser) return res.status(404).json({ error: 'User not found' });
+
+    const client = getDinariClient();
+    const eoa = toChecksumAddress(walletAddress) as `0x${string}`;
+    const [{ token: depTok, decimals: depDec }, swDerived] = await Promise.all([
+      resolveUserOmnibusDepositToken(client, dbUser.account_id, cfg.depositChainCaip2),
+      deriveSmartWallet(eoa),
+    ]);
+    const smartWallet = swDerived as `0x${string}`;
+    const required = parseUnits(pending.payment_amount, depDec);
+
+    let transferred = 0n;
+    if (depositUserOpHash && String(depositUserOpHash).startsWith('0x')) {
+      transferred = await erc20TransferTotalFromUserOpHash(
+        depositUserOpHash as `0x${string}`,
+        cfg.depositChainCaip2,
+        depTok,
+        smartWallet,
+        cfg.depositWallet,
+      );
+    }
+    if (transferred < required && depositTxHash && String(depositTxHash).startsWith('0x')) {
+      transferred = await erc20TransferTotalFromTxHash(
+        depositTxHash as `0x${string}`,
+        cfg.depositChainCaip2,
+        depTok,
+        smartWallet,
+        cfg.depositWallet,
+      );
+    }
+
+    if (transferred < required) {
+      return res.status(400).json({
+        error: 'Deposit not found or insufficient',
+        details:
+          'No matching ERC-20 transfer from the user smart wallet to the omnibus deposit address for this amount. Confirm the UserOp mined on the Dinari order chain or pass depositTxHash.',
+        required: pending.payment_amount,
+        observed: formatUnits(transferred, depDec),
+      });
+    }
+    const paymentAmt = parseFloat(pending.payment_amount);
+    let orderReq: any;
+    try {
+      orderReq = await client.v2.accounts.orderRequests.createMarketBuy(cfg.accountId, {
+        payment_amount: Math.round(paymentAmt * 100) / 100,
+        stock_id: pending.stock_id,
+        recipient_account_id: pending.recipient_account_id,
+        client_order_id: clientOrderId,
+      });
+    } catch (e: any) {
+      console.error('  Omnibus createMarketBuy failed:', e?.message || e);
+      updateOmnibusPendingBuy(clientOrderId, { status: 'failed' });
+      throw e;
+    }
+
+    updateOmnibusPendingBuy(clientOrderId, {
+      status: 'completed',
+      deposit_user_op_hash: depositUserOpHash || depositTxHash || null,
+    });
+
+    res.json({
+      success: true,
+      mode: 'omnibus',
+      orderRequest: orderReq,
+      clientOrderId,
+      recipientAccountId: pending.recipient_account_id,
+    });
+  } catch (error: any) {
+    console.error('Omnibus Confirm Buy Error:', error.message || error);
+    res.status(500).json({ error: 'Failed to confirm omnibus buy', details: error.message });
+  }
+});
+
+// ── OMNIBUS / MANAGED WALLET SELL (dShare → omnibus, managed market sell → user account) ─
+router.post('/order/omnibus/prepare-sell', async (req, res) => {
+  try {
+    const cfg = omnibusDepositConfig();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'Omnibus not configured',
+        details: 'Set OMNIBUS_ACCOUNT_ID and OMNIBUS_MANAGED_WALLET in .env',
+      });
+    }
+    const { walletAddress, stockId, assetQuantity } = req.body;
+    if (!walletAddress || !stockId || assetQuantity == null)
+      return res.status(400).json({ error: 'walletAddress, stockId, assetQuantity required' });
+
+    const user = getUserByWallet(String(walletAddress).toLowerCase());
+    if (!user) return res.status(404).json({ error: 'User not set up. Call /setup first.' });
+
+    const qty = parseFloat(String(assetQuantity));
+    if (!Number.isFinite(qty) || qty <= 0)
+      return res.status(400).json({ error: 'assetQuantity must be a positive number' });
+
+    const client = getDinariClient();
+    const actualStockId = await resolveStockId(client, stockId);
+    await ensureStocksCache(client);
+    const stock = cachedStocks.find((s) => s.id === actualStockId);
+    if (!stock?.token_address) {
+      return res.status(400).json({
+        error: 'Stock token not available',
+        details: `Cannot resolve token address for stock ${actualStockId}`,
+      });
+    }
+
+    const tokenAddress = toChecksumAddress(stock.token_address) as `0x${string}`;
+    const assetDecimals = Number.isFinite(Number(stock.token_decimals))
+      ? Number(stock.token_decimals)
+      : 18;
+    const clientOrderId = randomUUID();
+
+    insertOmnibusPendingSell({
+      client_order_id: clientOrderId,
+      wallet_address: walletAddress,
+      recipient_account_id: user.account_id,
+      stock_id: actualStockId,
+      stock_token_address: tokenAddress,
+      asset_quantity: qty.toFixed(Math.min(assetDecimals, 6)),
+      asset_decimals: assetDecimals,
+    });
+
+    const eoaChecksum = toChecksumAddress(walletAddress);
+    const smartWallet = (await deriveSmartWallet(eoaChecksum)) as `0x${string}`;
+    res.json({
+      mode: 'omnibus',
+      side: 'SELL',
+      clientOrderId,
+      depositAddress: cfg.depositWallet,
+      assetToken: tokenAddress,
+      assetDecimals,
+      depositChainId: ORDER_CHAIN_ID,
+      assetQuantity: qty,
+      payerSmartWallet: smartWallet,
+      recipientDinariAccountId: user.account_id,
+      stockId: actualStockId,
+    });
+  } catch (error: any) {
+    console.error('Omnibus Prepare Sell Error:', error.message || error);
+    res.status(500).json({ error: 'Failed to prepare omnibus sell', details: error.message });
+  }
+});
+
+router.get('/order/omnibus/sell-transfer-userop', async (req, res) => {
+  try {
+    const cfg = omnibusDepositConfig();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'Omnibus not configured',
+        details: 'Set OMNIBUS_ACCOUNT_ID and OMNIBUS_MANAGED_WALLET in .env',
+      });
+    }
+    const walletAddress = typeof req.query.walletAddress === 'string' ? req.query.walletAddress.trim() : '';
+    const clientOrderId = typeof req.query.clientOrderId === 'string' ? req.query.clientOrderId.trim() : '';
+    if (!walletAddress || !clientOrderId)
+      return res.status(400).json({ error: 'walletAddress and clientOrderId query params required' });
+
+    const pending = getOmnibusPendingSell(clientOrderId);
+    if (!pending || pending.wallet_address !== walletAddress.toLowerCase()) {
+      return res.status(404).json({ error: 'Unknown or expired clientOrderId for this wallet' });
+    }
+    if (pending.status !== 'awaiting_deposit') {
+      return res.status(400).json({ error: `Invalid status: ${pending.status}` });
+    }
+
+    const eoa = toChecksumAddress(walletAddress) as `0x${string}`;
+    const smartWallet = (await deriveSmartWallet(eoa)) as `0x${string}`;
+    const amountWei = parseUnits(pending.asset_quantity, pending.asset_decimals || 18);
+    const data = encodeFunctionData({
+      abi: erc20TransferCallAbi,
+      functionName: 'transfer',
+      args: [cfg.depositWallet, amountWei],
+    });
+
+    const { userOp, userOpHash } = await buildUserOperation(
+      eoa,
+      [{ to: toChecksumAddress(pending.stock_token_address) as `0x${string}`, data, value: 0n }],
+      aaNetworkFromCaip2(ORDER_CHAIN_ID),
+    );
+
+    const bigIntReplacer = (_k: string, v: unknown) => (typeof v === 'bigint' ? v.toString() : v);
+    res.json(
+      JSON.parse(
+        JSON.stringify(
+          {
+            userOp,
+            userOpHash,
+            smartAccountAddress: smartWallet,
+            executeUserOpChainId: ORDER_CHAIN_ID,
+            assetToken: pending.stock_token_address,
+            assetQuantity: pending.asset_quantity,
+          },
+          bigIntReplacer,
+        ),
+      ),
+    );
+  } catch (error: any) {
+    console.error('Omnibus Sell Transfer UserOp Error:', error.message || error);
+    res.status(500).json({ error: 'Failed to build sell transfer UserOp', details: error.message });
+  }
+});
+
+router.post('/order/omnibus/confirm-sell', async (req, res) => {
+  try {
+    const cfg = omnibusDepositConfig();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'Omnibus not configured',
+        details: 'Set OMNIBUS_ACCOUNT_ID and OMNIBUS_MANAGED_WALLET in .env',
+      });
+    }
+    const { walletAddress, clientOrderId, depositUserOpHash, depositTxHash } = req.body;
+    if (!walletAddress || !clientOrderId)
+      return res.status(400).json({ error: 'walletAddress and clientOrderId required' });
+    if (!depositUserOpHash && !depositTxHash)
+      return res.status(400).json({ error: 'depositUserOpHash or depositTxHash required' });
+
+    const pending = getOmnibusPendingSell(clientOrderId);
+    if (!pending || pending.wallet_address !== String(walletAddress).toLowerCase()) {
+      return res.status(404).json({ error: 'Unknown clientOrderId for this wallet' });
+    }
+    if (['sell_submitted', 'payout_pending', 'completed'].includes(pending.status)) {
+      const acc = getOmnibusSellAccounting(clientOrderId);
+      if (acc) {
+        return res.json({
+          success: true,
+          mode: 'omnibus',
+          clientOrderId,
+          recipientAccountId: pending.recipient_account_id,
+          orderRequest: acc.order_request_id ? { id: acc.order_request_id, status: acc.sell_status } : null,
+          order: acc.order_id ? { id: acc.order_id, status: acc.sell_status } : null,
+          payout: {
+            paymentTokenQuantity: acc.net_payment_token_quantity ? Number(acc.net_payment_token_quantity) : 0,
+            status: acc.payout_status,
+            note: acc.payout_error,
+            withdrawalRequest: acc.payout_withdrawal_request_id
+              ? { id: acc.payout_withdrawal_request_id, status: acc.payout_status }
+              : null,
+          },
+          idempotent: true,
+        });
+      }
+      if (pending.status === 'sell_submitted' || pending.status === 'payout_pending') {
+        return res.json({
+          success: true,
+          mode: 'omnibus',
+          clientOrderId,
+          recipientAccountId: pending.recipient_account_id,
+          orderRequest: null,
+          order: null,
+          payout: {
+            paymentTokenQuantity: 0,
+            status: 'pending_proceeds',
+            note: 'Settlement is still processing.',
+            withdrawalRequest: null,
+          },
+          idempotent: true,
+        });
+      }
+      return res.status(400).json({ error: `Sell already processed (status=${pending.status})` });
+    }
+    if (pending.status !== 'awaiting_deposit') {
+      return res.status(400).json({ error: `Invalid status: ${pending.status}` });
+    }
+    if (isStalePending(pending.created_at, 60 * 60 * 1000)) {
+      updateOmnibusPendingSell(clientOrderId, { status: 'expired' });
+      return res.status(400).json({ error: 'clientOrderId expired; start a new prepare-sell' });
+    }
+
+    const eoa = toChecksumAddress(walletAddress) as `0x${string}`;
+    const smartWallet = (await deriveSmartWallet(eoa)) as `0x${string}`;
+    const token = toChecksumAddress(pending.stock_token_address) as `0x${string}`;
+    const required = parseUnits(pending.asset_quantity, pending.asset_decimals || 18);
+
+    let transferred = 0n;
+    if (depositUserOpHash && String(depositUserOpHash).startsWith('0x')) {
+      transferred = await erc20TransferTotalFromUserOpHash(
+        depositUserOpHash as `0x${string}`,
+        ORDER_CHAIN_ID,
+        token,
+        smartWallet,
+        cfg.depositWallet,
+      );
+    }
+    if (transferred < required && depositTxHash && String(depositTxHash).startsWith('0x')) {
+      transferred = await erc20TransferTotalFromTxHash(
+        depositTxHash as `0x${string}`,
+        ORDER_CHAIN_ID,
+        token,
+        smartWallet,
+        cfg.depositWallet,
+      );
+    }
+
+    if (transferred < required) {
+      return res.status(400).json({
+        error: 'Asset transfer not found or insufficient',
+        details:
+          'No matching dShare transfer from the user smart wallet to the omnibus address for this amount. Confirm the UserOp mined or pass depositTxHash.',
+        required: pending.asset_quantity,
+        observed: formatUnits(transferred, pending.asset_decimals || 18),
+      });
+    }
+
+    const client = getDinariClient();
+    const assetQty = parseFloat(pending.asset_quantity);
+    let orderReq: any;
+    try {
+      orderReq = await client.v2.accounts.orderRequests.createMarketSell(cfg.accountId, {
+        asset_quantity: Math.round(assetQty * 1e6) / 1e6,
+        stock_id: pending.stock_id,
+        recipient_account_id: pending.recipient_account_id,
+        client_order_id: clientOrderId,
+      });
+    } catch (e: any) {
+      console.error('  Omnibus createMarketSell failed:', e?.message || e);
+      updateOmnibusPendingSell(clientOrderId, { status: 'failed' });
+      throw e;
+    }
+
+    updateOmnibusPendingSell(clientOrderId, {
+      status: 'sell_submitted',
+      deposit_user_op_hash: depositUserOpHash || depositTxHash || null,
+    });
+
+    res.json({
+      success: true,
+      mode: 'omnibus',
+      orderRequest: orderReq,
+      order: null,
+      payout: {
+        paymentTokenQuantity: 0,
+        status: 'pending_proceeds',
+        note: 'Sell accepted. Proceeds and payout may take a moment to finalize.',
+        withdrawalRequest: null,
+      },
+      clientOrderId,
+      recipientAccountId: pending.recipient_account_id,
+    });
+
+    const cfgRef = cfg;
+    const recipientId = pending.recipient_account_id;
+    const orderReqIdStr = String(orderReq.id);
+    void (async () => {
+      try {
+        const c = getDinariClient();
+        let snap = await snapshotManagedSell(c, cfgRef.accountId, orderReqIdStr, recipientId);
+        if (snap.net <= 0) {
+          await sleep(300);
+          snap = await snapshotManagedSell(c, cfgRef.accountId, orderReqIdStr, recipientId);
+        }
+        let withdrawalRequest: any = null;
+        let payoutStatus: 'submitted' | 'unsupported' | 'failed' | 'pending_proceeds' = 'pending_proceeds';
+        let payoutNote: string | null = null;
+        if (snap.net > 0) {
+          try {
+            withdrawalRequest = await c.v2.accounts.withdrawalRequests.create(cfgRef.accountId, {
+              payment_token_quantity: round6(snap.net),
+              recipient_account_id: recipientId,
+            });
+            payoutStatus = 'submitted';
+          } catch (e: any) {
+            const msg = String(e?.message ?? e);
+            if (/feature is not supported in sandbox/i.test(msg)) {
+              payoutStatus = 'unsupported';
+              payoutNote =
+                'Managed withdrawal is not supported in Dinari sandbox. Sell completed, but auto-payout was skipped.';
+            } else {
+              payoutStatus = 'failed';
+              payoutNote = msg;
+            }
+          }
+        } else {
+          payoutNote = 'Sell order submitted, but proceeds are not posted yet. Re-check status shortly.';
+        }
+
+        upsertOmnibusSellAccounting({
+          client_order_id: clientOrderId,
+          omnibus_account_id: cfgRef.accountId,
+          recipient_account_id: recipientId,
+          order_request_id: String(snap.orderRequest?.id || orderReq.id || ''),
+          order_id: snap.order?.id ? String(snap.order.id) : null,
+          sell_status: String(snap.order?.status || snap.orderRequest?.status || 'PENDING'),
+          gross_payment_token_quantity: Number.isFinite(snap.gross) ? String(snap.gross) : null,
+          fee_payment_token_quantity: Number.isFinite(snap.fee) ? String(snap.fee) : null,
+          net_payment_token_quantity: Number.isFinite(snap.net) ? String(snap.net) : null,
+          payout_status: payoutStatus,
+          payout_withdrawal_request_id: withdrawalRequest?.id ? String(withdrawalRequest.id) : null,
+          payout_error: payoutNote,
+        });
+
+        updateOmnibusPendingSell(clientOrderId, {
+          status: payoutStatus === 'submitted' ? 'completed' : 'payout_pending',
+        });
+      } catch (e: any) {
+        console.error('Omnibus sell async settlement:', e?.message || e);
+        try {
+          updateOmnibusPendingSell(clientOrderId, { status: 'failed' });
+        } catch (_) {}
+      }
+    })();
+  } catch (error: any) {
+    console.error('Omnibus Confirm Sell Error:', error.message || error);
+    try {
+      const { clientOrderId } = req.body || {};
+      if (clientOrderId) updateOmnibusPendingSell(String(clientOrderId), { status: 'failed' });
+    } catch (_) {}
+    res.status(500).json({ error: 'Failed to confirm omnibus sell', details: error.message });
+  }
+});
+
+/** Managed omnibus → same-entity user account (Dinari processes on-chain settlement). */
+router.post('/order/omnibus/withdrawal-request', async (req, res) => {
+  try {
+    const cfg = getOmnibusEnv();
+    if (!cfg) {
+      return res.status(503).json({
+        error: 'Omnibus not configured',
+        details: 'Set OMNIBUS_ACCOUNT_ID and OMNIBUS_MANAGED_WALLET in .env',
+      });
+    }
+    const { walletAddress, paymentTokenQuantity } = req.body;
+    if (!walletAddress || paymentTokenQuantity == null)
+      return res.status(400).json({ error: 'walletAddress and paymentTokenQuantity required' });
+
+    const qty = parseFloat(String(paymentTokenQuantity));
+    if (!Number.isFinite(qty) || qty <= 0)
+      return res.status(400).json({ error: 'paymentTokenQuantity must be a positive number' });
+
+    const user = getUserByWallet(String(walletAddress).toLowerCase());
+    if (!user) return res.status(404).json({ error: 'User not set up. Call /setup first.' });
+
+    const client = getDinariClient();
+    const wr = await client.v2.accounts.withdrawalRequests.create(cfg.accountId, {
+      payment_token_quantity: Math.round(qty * 1e6) / 1e6,
+      recipient_account_id: user.account_id,
+    });
+
+    res.json({ success: true, withdrawalRequest: wr });
+  } catch (error: any) {
+    console.error('Omnibus Withdrawal Request Error:', error.message || error);
+    res.status(500).json({ error: 'Failed to create withdrawal request', details: error.message });
+  }
+});
+
 // ── PREPARE SELL ORDER (Dinari-sponsored EIP-712 permit) ──────────────────────
 router.post('/order/prepare-sell', async (req, res) => {
   try {
@@ -1108,28 +2005,60 @@ router.get('/portfolio/:walletAddress', async (req, res) => {
     const dShareTokens = cachedStocks
       .filter(s => s.token_address?.startsWith('0x'))
       .map(s => s.token_address);
-    if (dShareTokens.length === 0)
-      return res.json({ holdings: [], smartWalletAddress: null, totalValue: 0 });
+    if (dShareTokens.length === 0) {
+      const sandboxEarly = (process.env['DINARI_ENVIRONMENT'] || 'sandbox') === 'sandbox';
+      let smartWalletAddress: string | null = null;
+      try {
+        smartWalletAddress = await deriveSmartWallet(eoaAddress);
+      } catch (_) {}
+      let mockUsdBalance = 0;
+      let cashBalanceLabel = sandboxEarly ? 'mockUSD' : 'USDC';
+      const userEarly = getUserByWallet(eoaKey);
+      if (userEarly) {
+        const row = await getCashBalanceRowForChain(client, userEarly.account_id, ORDER_CHAIN_ID);
+        if (row) {
+          mockUsdBalance = Number.isFinite(row.amount) ? Math.round(row.amount * 1e4) / 1e4 : 0;
+          if (row.symbol) cashBalanceLabel = row.symbol;
+        }
+      }
+      return res.json({
+        holdings: [],
+        smartWalletAddress,
+        totalValue: 0,
+        mockUsdBalance,
+        cashBalanceLabel,
+        orderChainId: ORDER_CHAIN_ID,
+      });
+    }
 
-    const alchemyRpc = process.env['ALCHEMY_RPC_URL'] || 'https://arb-sepolia.g.alchemy.com/v2/demo';
+    const alchemyKey = process.env['ALCHEMY_API_KEY'] || '';
+    const alchemyRpc =
+      ORDER_CHAIN_ID === 'eip155:11155111'
+        ? process.env['ALCHEMY_SEPOLIA_RPC_URL']?.trim() ||
+          process.env['SEPOLIA_RPC_URL']?.trim() ||
+          (alchemyKey
+            ? `https://eth-sepolia.g.alchemy.com/v2/${alchemyKey}`
+            : 'https://ethereum-sepolia.publicnode.com')
+        : process.env['ALCHEMY_RPC_URL'] || 'https://arb-sepolia.g.alchemy.com/v2/demo';
 
     async function fetchBalances(addr: string) {
       const resp = await axios.post(alchemyRpc, {
         jsonrpc: '2.0', id: 1,
         method: 'alchemy_getTokenBalances',
         params: [addr.toLowerCase(), dShareTokens],
-      }, { timeout: 10000 });
+      }, { timeout: 7000 });
       return resp.data?.result?.tokenBalances || [];
     }
 
-    // Fetch for both EOA and smart wallet
-    const eoaBalances = await fetchBalances(eoaKey);
+    // EOA + smart wallet balances in parallel (major latency win vs sequential).
     let smartWalletAddress: string | null = null;
-    let swBalances: any[] = [];
     try {
       smartWalletAddress = await deriveSmartWallet(eoaAddress);
-      swBalances = await fetchBalances(smartWalletAddress);
     } catch (_) {}
+    const [eoaBalances, swBalances] = await Promise.all([
+      fetchBalances(eoaKey),
+      smartWalletAddress ? fetchBalances(smartWalletAddress) : Promise.resolve([] as any[]),
+    ]);
 
     const balanceMap: Record<string, bigint> = {};
     for (const tb of [...eoaBalances, ...swBalances]) {
@@ -1138,28 +2067,115 @@ router.get('/portfolio/:walletAddress', async (req, res) => {
       balanceMap[addr] = (balanceMap[addr] || 0n) + raw;
     }
 
-    const holdings: any[] = [];
-    let totalValue = 0;
+    type Position = { stock: (typeof cachedStocks)[0]; balance: number };
+    const positions: Position[] = [];
     for (const [contractAddr, rawBal] of Object.entries(balanceMap)) {
       if (rawBal === 0n) continue;
       const stock = cachedStocks.find(s => s.token_address.toLowerCase() === contractAddr);
       if (!stock) continue;
-      const balance = Number(rawBal) / 1e18;
-      let price = 0;
-      try {
-        const q = await client.v2.marketData.stocks.retrieveCurrentQuote(stock.id);
-        price = (q as any)?.price ?? 0;
-      } catch (_) {}
-      const value = balance * price;
-      totalValue += value;
-      holdings.push({ ticker: stock.ticker, name: stock.name, stockId: stock.id, tokenAddress: stock.token_address, balance, price, value });
+      positions.push({ stock, balance: Number(rawBal) / 1e18 });
     }
-    res.json({ holdings, smartWalletAddress, totalValue });
+    const portfolioUser = getUserByWallet(eoaKey);
+    const sandbox = (process.env['DINARI_ENVIRONMENT'] || 'sandbox') === 'sandbox';
+
+    async function computeHoldings(): Promise<{ holdings: any[]; totalValue: number }> {
+      const holdings: any[] = await Promise.all(
+        positions.map(async ({ stock, balance }) => {
+          let price = 0;
+          try {
+            const q = await client.v2.marketData.stocks.retrieveCurrentQuote(stock.id);
+            price = pickQuotePriceUsd(q);
+          } catch (_) {}
+          const value = balance * price;
+          return {
+            ticker: stock.ticker,
+            name: stock.name,
+            stockId: stock.id,
+            tokenAddress: stock.token_address,
+            balance,
+            price,
+            value,
+          };
+        }),
+      );
+      let totalValue = 0;
+      for (const h of holdings) totalValue += h.value;
+      return { holdings, totalValue };
+    }
+
+    async function resolveMockUsdCash(): Promise<{ mockUsdBalance: number; cashBalanceLabel: string }> {
+      let mockUsdBalance = 0;
+      let cashBalanceLabel = sandbox ? 'mockUSD' : 'USDC';
+      if (!portfolioUser) return { mockUsdBalance, cashBalanceLabel };
+      const row = await getCashBalanceRowForChain(client, portfolioUser.account_id, ORDER_CHAIN_ID);
+      if (row) {
+        mockUsdBalance = Number.isFinite(row.amount) ? Math.round(row.amount * 1e4) / 1e4 : 0;
+        if (row.symbol) cashBalanceLabel = row.symbol;
+      }
+      if (mockUsdBalance <= 0) {
+        try {
+          const { token: cashTok } = await resolveUserOmnibusDepositToken(
+            client,
+            portfolioUser.account_id,
+            ORDER_CHAIN_ID,
+          );
+          const sw = smartWalletAddress
+            ? (toChecksumAddress(smartWalletAddress) as `0x${string}`)
+            : ((await deriveSmartWallet(eoaAddress)) as `0x${string}`);
+          const eoaC = toChecksumAddress(eoaKey) as `0x${string}`;
+          const a = await readErc20Balance(ORDER_CHAIN_ID, cashTok, eoaC);
+          const b = await readErc20Balance(ORDER_CHAIN_ID, cashTok, sw);
+          const decA = a?.decimals ?? 6;
+          const decB = b?.decimals ?? 6;
+          const sum =
+            (a ? Number(formatUnits(a.raw, decA)) : 0) + (b ? Number(formatUnits(b.raw, decB)) : 0);
+          mockUsdBalance = Math.round(sum * 1e6) / 1e6;
+        } catch (_) {}
+      }
+      return { mockUsdBalance, cashBalanceLabel };
+    }
+
+    const [{ holdings, totalValue }, { mockUsdBalance, cashBalanceLabel }] = await Promise.all([
+      computeHoldings(),
+      resolveMockUsdCash(),
+    ]);
+
+    res.json({
+      holdings,
+      smartWalletAddress,
+      totalValue,
+      mockUsdBalance,
+      cashBalanceLabel,
+      orderChainId: ORDER_CHAIN_ID,
+    });
   } catch (error: any) {
     console.error('Portfolio Error:', error.message || error);
     res.status(500).json({ error: 'Failed to fetch portfolio', details: error.message });
   }
 });
+
+function mapOrderRequestRow(o: any) {
+  const sid = o.stock_id != null ? String(o.stock_id) : '';
+  const stock = cachedStocks.find((s) => s.id === sid);
+  const createdRaw = o.created_dt ?? o.created_at ?? o.createdDt ?? '';
+  const created = createdRaw != null && String(createdRaw).trim() !== '' ? String(createdRaw) : '';
+  return {
+    id: String(o.id ?? ''),
+    order_request_id: String(o.id ?? ''),
+    order_id: o.order_id != null ? String(o.order_id) : '',
+    stock_id: sid,
+    ticker: stock?.ticker ?? '',
+    stock_name: stock?.name ?? '',
+    order_side: String(o.order_side ?? ''),
+    order_type: String(o.order_type ?? ''),
+    status: String(o.status ?? ''),
+    payment_amount: o.payment_amount ?? o.notional ?? null,
+    asset_quantity: o.asset_quantity ?? o.asset_token_quantity ?? null,
+    created_at: created,
+    source_account_id: o.account_id != null ? String(o.account_id) : '',
+    recipient_account_id: o.recipient_account_id != null ? String(o.recipient_account_id) : '',
+  };
+}
 
 // ── ORDERS: List order history ────────────────────────────────────────────────
 router.get('/orders/:walletAddress', async (req, res) => {
@@ -1168,17 +2184,79 @@ router.get('/orders/:walletAddress', async (req, res) => {
     if (!user) return res.status(404).json({ error: 'User not found' });
     const client = getDinariClient();
     await ensureStocksCache(client);
-    const orders = await client.v2.accounts.orderRequests.list(user.account_id);
-    res.json({
-      orders: (orders as any[]).map((o: any) => {
-        const stock = cachedStocks.find(s => s.id === o.stock_id);
-        return {
-          id: o.id, stock_id: o.stock_id, ticker: stock?.ticker || '', stock_name: stock?.name || '',
-          order_side: o.order_side, order_type: o.order_type, status: o.status,
-          payment_amount: o.payment_amount, asset_quantity: o.asset_quantity, created_at: o.created_at,
-        };
-      }),
+
+    const ownReqs = normalizeSdkList(
+      await client.v2.accounts.orderRequests.list(user.account_id),
+    );
+    const byId = new Map<string, any>();
+    for (const o of ownReqs) {
+      if (o?.id != null) byId.set(String(o.id), o);
+    }
+
+    const omnibus = getOmnibusEnv();
+    if (omnibus && omnibus.accountId !== user.account_id) {
+      try {
+        const omniReqs = normalizeSdkList(
+          await client.v2.accounts.orderRequests.list(omnibus.accountId),
+        );
+        for (const o of omniReqs) {
+          if (String(o.recipient_account_id || '') !== String(user.account_id)) continue;
+          byId.set(String(o.id), o);
+        }
+      } catch (e: any) {
+        console.warn('  Omnibus order_request list skipped:', e?.message || e);
+      }
+    }
+
+    const merged = [...byId.values()].sort((a: any, b: any) => {
+      const ta = new Date(a.created_dt || a.created_at || 0).getTime();
+      const tb = new Date(b.created_dt || b.created_at || 0).getTime();
+      return tb - ta;
     });
+
+    const orderRows = merged.map(mapOrderRequestRow);
+
+    const detailById = new Map<string, any>();
+    try {
+      const ordUser = normalizeSdkList(await client.v2.accounts.orders.list(user.account_id));
+      for (const ord of ordUser) {
+        if (ord?.id != null) detailById.set(String(ord.id), ord);
+      }
+    } catch (_) {}
+    if (omnibus && omnibus.accountId !== user.account_id) {
+      try {
+        const ordOmni = normalizeSdkList(await client.v2.accounts.orders.list(omnibus.accountId));
+        const linkedOrderIds = new Set(
+          merged
+            .filter((r: any) => String(r.recipient_account_id || '') === String(user.account_id))
+            .map((r: any) => String(r.order_id || ''))
+            .filter(Boolean),
+        );
+        for (const ord of ordOmni) {
+          if (ord.id && linkedOrderIds.has(String(ord.id))) {
+            detailById.set(String(ord.id), ord);
+          }
+        }
+      } catch (_) {}
+    }
+
+    for (const row of orderRows as any[]) {
+      const ord =
+        row.order_id && String(row.order_id).trim() !== ''
+          ? detailById.get(String(row.order_id))
+          : undefined;
+      if (!ord) continue;
+      row.brokerage_status = String(ord.status ?? '');
+      if (row.order_side === 'BUY' && ord.payment_token_quantity != null && row.payment_amount == null) {
+        row.payment_amount = ord.payment_token_quantity;
+      }
+      if (row.order_side === 'SELL' && ord.asset_token_quantity != null && row.asset_quantity == null) {
+        row.asset_quantity = ord.asset_token_quantity;
+      }
+      if (ord.status) row.status = ord.status;
+    }
+
+    res.json({ orders: orderRows });
   } catch (error: any) {
     console.error('Orders Error:', error.message || error);
     res.status(500).json({ error: 'Failed to fetch orders', details: error.message });
@@ -1309,6 +2387,53 @@ router.get('/debug/account/:walletAddress', async (req, res) => {
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message });
+  }
+});
+
+// ── DEBUG: Omnibus pending orders (local DB state) ────────────────────────────
+router.get('/debug/omnibus', (req, res) => {
+  try {
+    const walletAddress =
+      typeof req.query.walletAddress === 'string' ? req.query.walletAddress.trim().toLowerCase() : '';
+    const clientOrderId =
+      typeof req.query.clientOrderId === 'string' ? req.query.clientOrderId.trim() : '';
+    const sideRaw = typeof req.query.side === 'string' ? req.query.side.trim().toLowerCase() : '';
+    const side = sideRaw === 'buy' || sideRaw === 'sell' ? sideRaw : 'all';
+    const limitRaw = typeof req.query.limit === 'string' ? parseInt(req.query.limit, 10) : NaN;
+    const limit = Number.isFinite(limitRaw) ? limitRaw : 50;
+
+    const filters = {
+      wallet_address: walletAddress || undefined,
+      client_order_id: clientOrderId || undefined,
+      limit,
+    };
+
+    const buys = side === 'sell' ? [] : listOmnibusPendingBuys(filters);
+    const sells = side === 'buy' ? [] : listOmnibusPendingSells(filters);
+    const sellAccounting =
+      clientOrderId && (side === 'sell' || side === 'all')
+        ? getOmnibusSellAccounting(clientOrderId)
+        : null;
+
+    res.json({
+      ok: true,
+      filters: {
+        walletAddress: walletAddress || null,
+        clientOrderId: clientOrderId || null,
+        side,
+        limit: Math.max(1, Math.min(limit, 200)),
+      },
+      counts: {
+        buys: buys.length,
+        sells: sells.length,
+      },
+      buys,
+      sells,
+      sellAccounting,
+    });
+  } catch (error: any) {
+    console.error('Debug Omnibus Error:', error.message || error);
+    res.status(500).json({ error: 'Failed to inspect omnibus state', details: error.message });
   }
 });
 

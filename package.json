@@ -5,7 +5,8 @@
   "scripts": {
     "start": "ts-node src/server.ts",
     "dev": "ts-node src/server.ts",
-    "build": "tsc"
+    "build": "tsc",
+    "test:portfolio-math": "ts-node scripts/test-portfolio-math.ts"
   },
   "keywords": [],
   "author": "",
