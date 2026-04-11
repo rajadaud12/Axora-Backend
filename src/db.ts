@@ -325,4 +325,82 @@ export function upsertOmnibusSellAccounting(row: {
   );
 }
 
+// ── Persona KYC (one row per app user reference-id, matches Persona reference-id) ──
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS persona_kyc (
+    reference_id TEXT PRIMARY KEY,
+    inquiry_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    verified INTEGER NOT NULL DEFAULT 0,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_persona_kyc_inquiry ON persona_kyc(inquiry_id);
+`);
+
+/** Aligns with Persona \`reference-id\` sent from the mobile app (e.g. Privy DID). */
+export function normalizePersonaReferenceId(raw: string | undefined): string | undefined {
+  if (raw == null || typeof raw !== 'string') return undefined;
+  const t = raw.trim();
+  return t.length > 0 ? t : undefined;
+}
+
+/** Best-effort: Persona status strings vary; treat approved/passed/completed as verified. */
+export function inferPersonaVerified(status: string): number {
+  const s = (status || '').toLowerCase();
+  if (
+    s.includes('approve') ||
+    s.includes('passed') ||
+    s.includes('completed') ||
+    s.includes('success')
+  ) {
+    return 1;
+  }
+  return 0;
+}
+
+export interface PersonaKycRow {
+  reference_id: string;
+  inquiry_id: string;
+  status: string;
+  verified: number;
+  updated_at: string;
+}
+
+export function upsertPersonaKyc(params: {
+  referenceId: string;
+  inquiryId: string;
+  status: string;
+  verified: number;
+}): void {
+  const stmt = db.prepare(`
+    INSERT INTO persona_kyc (reference_id, inquiry_id, status, verified, updated_at)
+    VALUES (?, ?, ?, ?, datetime('now'))
+    ON CONFLICT(reference_id) DO UPDATE SET
+      inquiry_id = excluded.inquiry_id,
+      status = excluded.status,
+      verified = excluded.verified,
+      updated_at = datetime('now')
+  `);
+  stmt.run(params.referenceId, params.inquiryId, params.status, params.verified);
+}
+
+export function getPersonaKycByReference(referenceId: string): PersonaKycRow | undefined {
+  const stmt = db.prepare('SELECT * FROM persona_kyc WHERE reference_id = ?');
+  return stmt.get(referenceId) as PersonaKycRow | undefined;
+}
+
+export function updatePersonaKycByInquiry(
+  inquiryId: string,
+  status: string,
+  verified: number,
+): boolean {
+  const stmt = db.prepare(`
+    UPDATE persona_kyc
+    SET status = ?, verified = ?, updated_at = datetime('now')
+    WHERE inquiry_id = ?
+  `);
+  return stmt.run(status, verified, inquiryId).changes > 0;
+}
+
 export default db;

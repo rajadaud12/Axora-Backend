@@ -4,6 +4,7 @@ import cors from 'cors';
 import marketRoutes from './routes/market';
 import earnRoutes from './routes/earn';
 import dinariRoutes from './routes/dinari';
+import kycRoutes from './routes/kyc';
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -14,6 +15,7 @@ app.use(express.json());
 app.use('/api/market', marketRoutes);
 app.use('/api/earn', earnRoutes);
 app.use('/api/dinari', dinariRoutes);
+app.use('/api/kyc', kycRoutes);
 
 app.get('/health', (req, res) => {
   res.json({ status: 'ok' });
