@@ -1,9 +1,12 @@
+import 'dotenv/config';
 import { createPublicClient, http } from 'viem';
 import { arbitrumSepolia } from 'viem/chains';
 
+const rpcUrl = process.env.ALCHEMY_RPC_URL || 'https://arbitrum-sepolia.publicnode.com';
+
 const client = createPublicClient({ 
   chain: arbitrumSepolia, 
-  transport: http('https://arb-sepolia.g.alchemy.com/v2/IDzFwDceLqm3Uw5WUpOG0') 
+  transport: http(rpcUrl) 
 });
 
 const USER = '0xc23f158AF4d96b0E2a1846d8E29F3dB1670a942F';
